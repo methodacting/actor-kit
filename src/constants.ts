@@ -1,4 +1,5 @@
 import { CallerType } from "./types";
+import type { AlarmType } from "./alarms";
 
 export const HEADERS = {
   X_CALLER_ID: "X-Caller-ID",
@@ -16,6 +17,15 @@ export const CallerTypes: Record<CallerType, CallerType> = {
   client: "client",
   system: "system", // Handled internally by Actor Kit
   service: "service",
+};
+
+/**
+ * Alarm types supported by the alarm system
+ */
+export const AlarmTypes: Record<AlarmType, AlarmType> = {
+  "xstate-delay": "xstate-delay",
+  "cache-cleanup": "cache-cleanup",
+  custom: "custom",
 };
 
 export const PERSISTED_SNAPSHOT_KEY = "persistedSnapshot";

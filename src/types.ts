@@ -14,6 +14,8 @@ import type {
   RequestInfoSchema,
   SystemEventSchema,
 } from "./schemas";
+import type { AlarmManager } from "./alarms";
+import type { ActorKitStorage } from "./storage";
 
 export type EnvWithDurableObjects = {
   ACTOR_KIT_SECRET: string;
@@ -151,10 +153,6 @@ export type BaseActorKitStateMachine = ActorKitStateMachine<
   AnyActorKitInput,
   AnyActorKitContext
 >;
-
-export type MachineServerOptions = {
-  persisted?: boolean;
-};
 
 export type ExtraContext = {
   requestId: string;
@@ -312,3 +310,25 @@ export type EnvFromMachine<TMachine extends AnyActorKitStateMachine> =
   ExtractEnvType<ExtractEventType<TMachine>> extends never
     ? EnvWithDurableObjects
     : ExtractEnvType<ExtractEventType<TMachine>> & EnvWithDurableObjects;
+
+// ==================== Alarm & Storage Types ====================
+
+/**
+ * Options for creating a MachineServer with alarm support
+ */
+export interface MachineServerOptions {
+  persisted?: boolean;
+  /**
+   * Enable alarm-based scheduling for XState delayed events
+   * @default true
+   */
+  enableAlarms?: boolean;
+}
+
+/**
+ * Internal services available to the machine server
+ */
+export interface MachineServerServices {
+  storage: ActorKitStorage;
+  alarmManager: AlarmManager | null;
+}

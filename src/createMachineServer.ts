@@ -13,7 +13,7 @@ import {
 } from "xstate";
 import { xstateMigrate } from "xstate-migrate";
 import { z } from "zod";
-import { PERSISTED_SNAPSHOT_KEY } from "./constants";
+import { AlarmTypes, PERSISTED_SNAPSHOT_KEY } from "./constants";
 import { CallerSchema } from "./schemas";
 import {
   ActorKitInputProps,
@@ -29,6 +29,13 @@ import {
   WithActorKitContext,
   WithActorKitEvent,
 } from "./types";
+import { ActorKitStorage } from "./storage";
+import { AlarmManager, generateAlarmId } from "./alarms";
+import {
+  createAlarmScheduler,
+  handleXStateAlarm,
+  restoreScheduledEvents,
+} from "./durable-object-system";
 import { assert, getCallerFromRequest } from "./utils";
 
 // Define schemas for storage and WebSocket attachments
@@ -103,11 +110,14 @@ export const createMachineServer = <
       { snapshot: SnapshotFrom<TMachine>; timestamp: number }
     > = new Map();
     state: DurableObjectState;
-    storage: DurableObjectStorage;
+    storage: ActorKitStorage; // Now uses SQLite storage wrapper
+    kvStorage: DurableObjectStorage; // Keep reference for backward compatibility
     attachments: Map<WebSocket, WebSocketAttachment>;
     subscriptions: Map<WebSocket, Subscription>;
     env: EnvFromMachine<TMachine>;
     currentChecksum: string | null = null;
+    alarmManager: AlarmManager | null = null; // Alarm manager for delayed events
+    private enableAlarms: boolean;
 
     /**
      * Constructor for the MachineServerImpl class.
@@ -120,52 +130,87 @@ export const createMachineServer = <
     ) {
       super(state, env);
       this.state = state;
-      this.storage = state.storage;
+      this.kvStorage = state.storage;
+      this.storage = new ActorKitStorage(state.storage);
       this.env = env;
       this.attachments = new Map();
       this.subscriptions = new Map();
+      this.enableAlarms = options?.enableAlarms !== false;
+
+      // Initialize alarm manager if alarms are enabled
+      if (this.enableAlarms) {
+        this.alarmManager = new AlarmManager(this.storage, state);
+      }
 
       // Initialize actor data from storage
       this.state.blockConcurrencyWhile(async () => {
-        const [actorType, actorId, initialCallerString, inputString] =
-          await Promise.all([
-            this.storage.get("actorType"),
-            this.storage.get("actorId"),
-            this.storage.get("initialCaller"),
-            this.storage.get("input"),
-          ]);
-        console.debug(
-          `[${this.actorId}] Attempting to load actor data from storage`
-        );
+        // Try to load from SQLite first (new format)
+        const actorMeta = await this.storage.getActorMeta();
 
-        if (actorType && actorId && initialCallerString && inputString) {
-          try {
-            const parsedData = StorageSchema.parse({
-              actorType,
-              actorId,
-              initialCaller: JSON.parse(
-                initialCallerString as string
-              ) as Caller,
-              input: JSON.parse(inputString as string),
-            });
+        if (actorMeta) {
+          // Loaded from SQLite
+          this.actorType = actorMeta.actorType;
+          this.actorId = actorMeta.actorId;
+          this.initialCaller = actorMeta.initialCaller;
+          this.input = actorMeta.input;
+        } else {
+          // Try legacy KV format for migration
+          const [actorType, actorId, initialCallerString, inputString] =
+            await Promise.all([
+              this.kvStorage.get("actorType"),
+              this.kvStorage.get("actorId"),
+              this.kvStorage.get("initialCaller"),
+              this.kvStorage.get("input"),
+            ]);
 
-            this.actorType = parsedData.actorType;
-            this.actorId = parsedData.actorId;
-            this.initialCaller = parsedData.initialCaller;
-            this.input = parsedData.input;
+          if (actorType && actorId && initialCallerString && inputString) {
+            try {
+              const parsedData = StorageSchema.parse({
+                actorType,
+                actorId,
+                initialCaller: JSON.parse(
+                  initialCallerString as string
+                ) as Caller,
+                input: JSON.parse(inputString as string),
+              });
 
-            if (options?.persisted) {
-              const persistedSnapshot = await this.loadPersistedSnapshot();
-              if (persistedSnapshot) {
-                this.restorePersistedActor(persistedSnapshot);
-              } else {
-                this.#ensureActorRunning();
-              }
+              this.actorType = parsedData.actorType;
+              this.actorId = parsedData.actorId;
+              this.initialCaller = parsedData.initialCaller;
+              this.input = parsedData.input;
+
+              // Migrate to SQLite
+              await this.storage.setActorMeta({
+                actorId: this.actorId,
+                actorType: this.actorType,
+                initialCaller: this.initialCaller,
+                input: this.input,
+              });
+            } catch (error) {
+              console.error("Failed to parse stored data:", error);
+            }
+          }
+        }
+
+        if (this.actorId) {
+          console.debug(
+            `[${this.actorId}] Attempting to load actor data from storage`
+          );
+
+          if (options?.persisted) {
+            // Try SQLite first, then fall back to KV
+            let persistedSnapshot = await this.loadPersistedSnapshotFromSQLite();
+            if (!persistedSnapshot) {
+              persistedSnapshot = await this.loadPersistedSnapshotFromKV();
+            }
+
+            if (persistedSnapshot) {
+              await this.restorePersistedActor(persistedSnapshot);
             } else {
               this.#ensureActorRunning();
             }
-          } catch (error) {
-            console.error("Failed to parse stored data:", error);
+          } else {
+            this.#ensureActorRunning();
           }
         }
 
@@ -173,9 +218,12 @@ export const createMachineServer = <
         this.state.getWebSockets().forEach((ws) => {
           this.#subscribeSocketToActor(ws);
         });
-      });
 
-      this.#startPeriodicCacheCleanup();
+        // Schedule cache cleanup alarm if alarms are enabled
+        if (this.alarmManager) {
+          await this.#scheduleCacheCleanupAlarm();
+        }
+      });
     }
 
     /**
@@ -194,10 +242,23 @@ export const createMachineServer = <
           id: this.actorId,
           caller: this.initialCaller,
           env: this.env,
-          storage: this.storage,
+          storage: this.kvStorage, // Use KV storage for machine compatibility
           ...this.input,
         } satisfies ActorKitInputProps;
-        this.actor = createActor(machine, { input } as any);
+
+        // Create actor with durable object system if alarms are enabled
+        const actorOptions: any = { input };
+
+        this.actor = createActor(machine, actorOptions);
+
+        // Monkey patch the scheduler to use alarms if alarm manager is available
+        if (this.alarmManager && this.actor.system) {
+          console.debug(`[${this.actorId}] Replacing scheduler with alarm-based scheduler`);
+          this.actor.system.scheduler = createAlarmScheduler(
+            this.alarmManager,
+            this.actor.system
+          );
+        }
 
         if (options?.persisted) {
           console.debug(
@@ -246,9 +307,6 @@ export const createMachineServer = <
         snapshot: fullSnapshot,
         timestamp: Date.now(),
       });
-
-      // Schedule cleanup for this snapshot
-      this.#scheduleSnapshotCacheCleanup(currentChecksum);
 
       // Update current checksum
       this.currentChecksum = currentChecksum;
@@ -307,10 +365,21 @@ export const createMachineServer = <
           compare(this.lastPersistedSnapshot, snapshot).length > 0
         ) {
           console.debug(`[${this.actorId}] Persisting new snapshot`);
-          await this.storage.put(
+
+          // Calculate checksum
+          const checksum = this.#calculateChecksum(snapshot);
+
+          // Save to SQLite (new format)
+          if (this.actorId) {
+            await this.storage.setSnapshot(this.actorId, snapshot, checksum);
+          }
+
+          // Also save to KV for backward compatibility during migration
+          await this.kvStorage.put(
             PERSISTED_SNAPSHOT_KEY,
             JSON.stringify(snapshot)
           );
+
           this.lastPersistedSnapshot = snapshot;
         } else {
           console.debug(
@@ -579,13 +648,13 @@ export const createMachineServer = <
       input: Record<string, unknown>;
     }) {
       if (!this.actorType && !this.actorId && !this.initialCaller) {
-        // Store actor data in storage
-        await Promise.all([
-          this.storage.put("actorType", props.actorType),
-          this.storage.put("actorId", props.actorId),
-          this.storage.put("initialCaller", JSON.stringify(props.caller)),
-          this.storage.put("input", JSON.stringify(props.input)),
-        ]).catch((error) => {
+        // Store actor data in SQLite storage
+        await this.storage.setActorMeta({
+          actorId: props.actorId,
+          actorType: props.actorType,
+          initialCaller: props.caller,
+          input: props.input,
+        }).catch((error) => {
           console.error("Error storing actor data:", error);
         });
 
@@ -599,54 +668,70 @@ export const createMachineServer = <
       }
     }
 
-    // New method for scheduling snapshot cache cleanup
-    #scheduleSnapshotCacheCleanup(checksum: string) {
-      const CLEANUP_DELAY = 300000; // 5 minutes, adjust as needed
-      setTimeout(() => {
-        this.#cleanupSnapshotCache(checksum);
-      }, CLEANUP_DELAY);
+    /**
+     * Schedule the cache cleanup alarm
+     * @private
+     */
+    async #scheduleCacheCleanupAlarm() {
+      if (!this.alarmManager) return;
+
+      const CLEANUP_INTERVAL = 300000; // 5 minutes
+      const alarmId = generateAlarmId();
+
+      await this.alarmManager.schedule({
+        id: alarmId,
+        type: AlarmTypes["cache-cleanup"],
+        scheduledAt: Date.now() + CLEANUP_INTERVAL,
+        repeatInterval: CLEANUP_INTERVAL, // Recurring
+        payload: {},
+      });
     }
 
-    // New method for periodic cache cleanup
-    #startPeriodicCacheCleanup() {
-      const CLEANUP_INTERVAL = 300000; // 5 minutes, adjust as needed
-      setInterval(() => {
-        const now = Date.now();
-        for (const [checksum, { timestamp }] of this.snapshotCache.entries()) {
-          if (now - timestamp > CLEANUP_INTERVAL) {
-            this.snapshotCache.delete(checksum);
-          }
-        }
-      }, CLEANUP_INTERVAL);
-    }
+    /**
+     * Handle cache cleanup alarm
+     * @private
+     */
+    async #handleCacheCleanupAlarm() {
+      const now = Date.now();
+      const CLEANUP_AGE = 300000; // 5 minutes
 
-    // New method for cleaning up snapshot cache
-    #cleanupSnapshotCache(checksum: string) {
-      if (checksum !== this.currentChecksum) {
-        const cachedData = this.snapshotCache.get(checksum);
-        if (cachedData) {
-          const now = Date.now();
-          if (now - cachedData.timestamp > 300000) {
-            // 5 minutes, same as CLEANUP_DELAY
-            this.snapshotCache.delete(checksum);
-          }
+      for (const [checksum, { timestamp }] of this.snapshotCache.entries()) {
+        if (now - timestamp > CLEANUP_AGE) {
+          this.snapshotCache.delete(checksum);
         }
       }
     }
 
-    // Add this method to load the persisted snapshot
-    async loadPersistedSnapshot(): Promise<SnapshotFrom<TMachine> | null> {
-      const snapshotString = await this.storage.get(PERSISTED_SNAPSHOT_KEY);
+    /**
+     * Load persisted snapshot from SQLite storage
+     * @private
+     */
+    async loadPersistedSnapshotFromSQLite(): Promise<SnapshotFrom<TMachine> | null> {
+      if (!this.actorId) return null;
+
+      const snapshotData = await this.storage.getSnapshot(this.actorId);
+      if (snapshotData) {
+        console.debug(`[${this.actorId}] Loaded persisted snapshot from SQLite`);
+        return snapshotData.snapshot as SnapshotFrom<TMachine>;
+      }
+      return null;
+    }
+
+    /**
+     * Load persisted snapshot from KV storage (legacy)
+     * @private
+     */
+    async loadPersistedSnapshotFromKV(): Promise<SnapshotFrom<TMachine> | null> {
+      const snapshotString = await this.kvStorage.get(PERSISTED_SNAPSHOT_KEY);
       if (snapshotString) {
-        console.debug(`[${this.actorId}] Loaded persisted snapshot`);
+        console.debug(`[${this.actorId}] Loaded persisted snapshot from KV`);
         return JSON.parse(snapshotString as string);
       }
-      console.debug(`[${this.actorId}] No persisted snapshot found`);
       return null;
     }
 
     // Add this method to restore the persisted actor
-    restorePersistedActor(persistedSnapshot: SnapshotFrom<TMachine>) {
+    async restorePersistedActor(persistedSnapshot: SnapshotFrom<TMachine>) {
       console.debug(
         `[${this.actorId}] Restoring persisted actor from `,
         persistedSnapshot
@@ -659,7 +744,7 @@ export const createMachineServer = <
       const input = {
         id: this.actorId,
         caller: this.initialCaller,
-        storage: this.storage,
+        storage: this.kvStorage, // Use KV storage for machine compatibility
         env: this.env,
         ...this.input,
       } as InputFrom<TMachine>;
@@ -674,10 +759,32 @@ export const createMachineServer = <
         migrations
       );
 
-      this.actor = createActor(machine, {
+      // Create actor options with system provider if alarms are enabled
+      const actorOptions: any = {
         snapshot: restoredSnapshot,
         input,
-      });
+      };
+
+      this.actor = createActor(machine, actorOptions);
+
+      // Monkey patch the scheduler to use alarms if alarm manager is available
+      if (this.alarmManager && this.actor.system) {
+        console.debug(`[${this.actorId}] Replacing scheduler with alarm-based scheduler (restored)`);
+        this.actor.system.scheduler = createAlarmScheduler(
+          this.alarmManager,
+          this.actor.system
+        );
+
+        // Restore any scheduled events from alarm storage
+        const pendingAlarms = await this.alarmManager.getPendingAlarms();
+        const xstateAlarms = pendingAlarms.filter((a) => a.type === "xstate-delay");
+        if (xstateAlarms.length > 0) {
+          restoreScheduledEvents(xstateAlarms.map((a) => ({
+            payload: a.payload as any,
+            scheduledAt: a.scheduledAt,
+          })));
+        }
+      }
 
       if (options?.persisted) {
         console.debug(
@@ -693,10 +800,45 @@ export const createMachineServer = <
         type: "RESUME",
         caller: { id: this.actorId, type: "system" },
         env: this.env,
-        storage: this.storage,
+        storage: this.kvStorage,
       } as any);
       console.debug(`[${this.actorId}] Sent RESUME event to restored actor`);
 
       this.lastPersistedSnapshot = restoredSnapshot as any;
+    }
+
+    /**
+     * Durable Object alarm handler
+     * Called when a scheduled alarm fires
+     */
+    async alarm(): Promise<void> {
+      if (!this.alarmManager) {
+        console.warn("Alarm fired but alarmManager is not initialized");
+        return;
+      }
+
+      console.debug(`[${this.actorId}] Alarm fired, processing due alarms`);
+
+      await this.alarmManager.handleDueAlarms(async (alarm) => {
+        switch (alarm.type) {
+          case AlarmTypes["cache-cleanup"]:
+            await this.#handleCacheCleanupAlarm();
+            return true;
+          case AlarmTypes["xstate-delay"]:
+            // Handle XState delayed events
+            if (this.actor) {
+              const eventData = alarm.payload as any;
+              console.debug(
+                `[${this.actorId}] Processing XState delayed event: ${eventData.scheduledEventId}`
+              );
+              // Use the handleXStateAlarm function to deliver the event
+              await handleXStateAlarm(eventData, this.actor);
+            }
+            return true;
+          default:
+            console.warn(`[${this.actorId}] Unknown alarm type: ${alarm.type}`);
+            return true;
+        }
+      });
     }
   };
