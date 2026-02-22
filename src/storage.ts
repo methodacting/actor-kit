@@ -109,7 +109,7 @@ export class ActorKitStorage {
   private initialized = false;
   private sql: DurableObjectStorage["sql"];
 
-  constructor(private storage: DurableObjectStorage) {
+  constructor(private readonly storage: DurableObjectStorage) {
     this.sql = storage.sql;
   }
 
@@ -149,7 +149,7 @@ export class ActorKitStorage {
     await this.ensureInitialized();
     const result = await this.sql.exec(
       "SELECT id, type, scheduled_at, repeat_interval, payload, created_at FROM alarms WHERE scheduled_at <= ? ORDER BY scheduled_at ASC",
-      [before]
+      before
     );
     return (await this.parseRows(result)) as AlarmRecord[];
   }
@@ -173,14 +173,12 @@ export class ActorKitStorage {
     await this.ensureInitialized();
     await this.sql.exec(
       "INSERT INTO alarms (id, type, scheduled_at, repeat_interval, payload, created_at) VALUES (?, ?, ?, ?, ?, ?)",
-      [
-        options.id,
-        options.type,
-        options.scheduledAt,
-        options.repeatInterval ?? null,
-        JSON.stringify(options.payload),
-        Date.now(),
-      ]
+      options.id,
+      options.type,
+      options.scheduledAt,
+      options.repeatInterval ?? null,
+      JSON.stringify(options.payload),
+      Date.now()
     );
   }
 
@@ -191,7 +189,10 @@ export class ActorKitStorage {
     await this.ensureInitialized();
     await this.sql.exec(
       "UPDATE alarms SET scheduled_at = ?, repeat_interval = ?, payload = ? WHERE id = ?",
-      [options.scheduledAt, options.repeatInterval ?? null, JSON.stringify(options.payload), options.id]
+      options.scheduledAt,
+      options.repeatInterval ?? null,
+      JSON.stringify(options.payload),
+      options.id
     );
   }
 
@@ -200,7 +201,7 @@ export class ActorKitStorage {
    */
   async deleteAlarm(id: string): Promise<void> {
     await this.ensureInitialized();
-    await this.sql.exec("DELETE FROM alarms WHERE id = ?", [id]);
+    await this.sql.exec("DELETE FROM alarms WHERE id = ?", id);
   }
 
   /**
@@ -208,7 +209,7 @@ export class ActorKitStorage {
    */
   async deleteAlarmsByType(type: string): Promise<void> {
     await this.ensureInitialized();
-    await this.sql.exec("DELETE FROM alarms WHERE type = ?", [type]);
+    await this.sql.exec("DELETE FROM alarms WHERE type = ?", type);
   }
 
   // ==================== Actor Metadata ====================
@@ -238,7 +239,7 @@ export class ActorKitStorage {
 
     const result = await this.sql.exec(
       "SELECT actor_id, actor_type, initial_caller, input, created_at, updated_at FROM actor_meta WHERE actor_id = ?",
-      [actorId]
+      actorId
     );
     const rows = (await this.parseRows(result)) as ActorMetaRecord[];
     if (rows.length === 0) return null;
@@ -266,14 +267,12 @@ export class ActorKitStorage {
         initial_caller = excluded.initial_caller,
         input = excluded.input,
         updated_at = excluded.updated_at`,
-      [
-        meta.actorId,
-        meta.actorType,
-        JSON.stringify(meta.initialCaller),
-        JSON.stringify(meta.input),
-        now,
-        now,
-      ]
+      meta.actorId,
+      meta.actorType,
+      JSON.stringify(meta.initialCaller),
+      JSON.stringify(meta.input),
+      now,
+      now
     );
   }
 
@@ -282,7 +281,7 @@ export class ActorKitStorage {
    */
   async deleteActorMeta(actorId: string): Promise<void> {
     await this.ensureInitialized();
-    await this.sql.exec("DELETE FROM actor_meta WHERE actor_id = ?", [actorId]);
+    await this.sql.exec("DELETE FROM actor_meta WHERE actor_id = ?", actorId);
   }
 
   // ==================== Snapshots ====================
@@ -294,7 +293,7 @@ export class ActorKitStorage {
     await this.ensureInitialized();
     const result = await this.sql.exec(
       "SELECT actor_id, snapshot, checksum, updated_at FROM snapshots WHERE actor_id = ?",
-      [actorId]
+      actorId
     );
     const rows = (await this.parseRows(result)) as SnapshotRecord[];
     if (rows.length === 0) return null;
@@ -319,7 +318,10 @@ export class ActorKitStorage {
         snapshot = excluded.snapshot,
         checksum = excluded.checksum,
         updated_at = excluded.updated_at`,
-      [actorId, JSON.stringify(snapshot), checksum ?? null, Date.now()]
+      actorId,
+      JSON.stringify(snapshot),
+      checksum ?? null,
+      Date.now()
     );
   }
 
@@ -328,7 +330,7 @@ export class ActorKitStorage {
    */
   async deleteSnapshot(actorId: string): Promise<void> {
     await this.ensureInitialized();
-    await this.sql.exec("DELETE FROM snapshots WHERE actor_id = ?", [actorId]);
+    await this.sql.exec("DELETE FROM snapshots WHERE actor_id = ?", actorId);
   }
 
   // ==================== Migration Helpers ====================
@@ -375,13 +377,13 @@ export class ActorKitStorage {
     if (result && typeof result[Symbol.asyncIterator] === "function") {
       const cursor = result as AsyncIterable<{ columns: string[]; results: (string | number | null)[][] }>;
       const rows: unknown[] = [];
-      let columns: string[] = [];
+      let columns: string[] | null = null;
 
       for await (const batch of cursor) {
         if (!columns) columns = batch.columns;
         for (const row of batch.results) {
           const obj: Record<string, unknown> = {};
-          columns.forEach((col, i) => {
+          (columns ?? []).forEach((col, i) => {
             obj[col] = row[i];
           });
           rows.push(obj);
@@ -390,9 +392,21 @@ export class ActorKitStorage {
       return rows;
     }
 
-    // Handle array format
-    if (Array.isArray(result) && result.length === 0) return [];
-    const { columns, rows } = result[0];
+    // Handle row batches returned by sql.exec()
+    const batches = Array.isArray(result) ? result : result ? [result] : [];
+    if (batches.length === 0) return [];
+
+    const first = batches[0] as {
+      columns?: string[];
+      columnNames?: string[];
+      rows?: unknown[][];
+      results?: unknown[][];
+    };
+
+    const columns = first?.columns ?? first?.columnNames ?? [];
+    const rows = first?.rows ?? first?.results ?? [];
+    if (!columns.length || !rows.length) return [];
+
     return rows.map((row: unknown[]) => {
       const obj: Record<string, unknown> = {};
       columns.forEach((col: string, i: number) => {
