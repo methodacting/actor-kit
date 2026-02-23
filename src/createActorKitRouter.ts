@@ -112,14 +112,17 @@ export const createActorKitRouter = <Env extends EnvWithDurableObjects>(
     }
 
     if (request.method === "GET") {
-      const { waitForEvent, waitForState, timeout, errorOnWaitTimeout } = 
-        Object.fromEntries(new URL(request.url).searchParams);
-      
+      const searchParams = new URL(request.url).searchParams;
+      const waitForEvent = searchParams.get("waitForEvent");
+      const waitForState = searchParams.get("waitForState");
+      const timeout = searchParams.get("timeout");
+      const errorOnWaitTimeout = searchParams.get("errorOnWaitTimeout");
+
       const result = await durableObjectStub.getSnapshot(caller, {
         waitForEvent: waitForEvent ? JSON.parse(waitForEvent) : undefined,
         waitForState: waitForState ? JSON.parse(waitForState) : undefined,
         timeout: timeout ? parseInt(timeout, 10) : undefined,
-        errorOnWaitTimeout: errorOnWaitTimeout ? errorOnWaitTimeout === 'true' : undefined,
+        errorOnWaitTimeout: errorOnWaitTimeout ? errorOnWaitTimeout === "true" : undefined,
       });
       return new Response(JSON.stringify(result), {
         headers: { "Content-Type": "application/json" },
