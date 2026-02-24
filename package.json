@@ -1,6 +1,6 @@
 {
   "name": "@methodacting/actor-kit",
-  "version": "0.47.0",
+  "version": "0.47.2",
   "main": "./dist/index.js",
   "module": "./dist/index.js",
   "types": "./dist/index.d.ts",
