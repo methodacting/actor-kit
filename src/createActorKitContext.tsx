@@ -11,18 +11,17 @@ import React, {
   useRef,
   useSyncExternalStore,
 } from "react";
-import { matchesState, StateValueFrom } from "xstate";
+import { AnyStateMachine, matchesState, StateValueFrom } from "xstate";
 import type { ActorKitClientProps } from "./createActorKitClient";
 import { createActorKitClient } from "./createActorKitClient";
 import type {
   ActorKitClient,
-  AnyActorKitStateMachine,
   CallerSnapshotFrom,
   ClientEventFrom,
   MatchesProps,
 } from "./types";
 
-export function createActorKitContext<TMachine extends AnyActorKitStateMachine>(
+export function createActorKitContext<TMachine extends AnyStateMachine>(
   actorType: string
 ) {
   const ActorKitContext = createContext<ActorKitClient<TMachine> | null>(null);

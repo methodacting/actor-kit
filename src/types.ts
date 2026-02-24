@@ -3,6 +3,7 @@ import { Operation } from "fast-json-patch";
 import type {
   AnyEventObject,
   AnyStateMachine,
+  EventFromLogic,
   SnapshotFrom,
   StateMachine,
   StateValueFrom,
@@ -24,7 +25,7 @@ export type EnvWithDurableObjects = {
 
 export type AnyEvent = z.infer<typeof AnyEventSchema>;
 
-export interface ActorServerMethods<TMachine extends BaseActorKitStateMachine> {
+export interface ActorServerMethods<TMachine extends AnyStateMachine> {
   fetch(request: Request): Promise<Response>;
   spawn(props: {
     actorType: string;
@@ -47,7 +48,7 @@ export interface ActorServerMethods<TMachine extends BaseActorKitStateMachine> {
   }>;
 }
 
-export type ActorServer<TMachine extends AnyActorKitStateMachine> =
+export type ActorServer<TMachine extends AnyStateMachine> =
   DurableObject & ActorServerMethods<TMachine>;
 export type AnyActorServer = ActorServer<any>;
 
@@ -68,11 +69,11 @@ type EventObject = {
 };
 
 type EventSchemaUnion = z.ZodDiscriminatedUnion<
-  "type",
   [
     z.ZodObject<z.ZodRawShape & { type: z.ZodString }>,
     ...z.ZodObject<z.ZodRawShape & { type: z.ZodString }>[]
-  ]
+  ],
+  "type"
 >;
 
 export type EventSchemas = {
@@ -127,7 +128,12 @@ export type WithActorKitInput<
   TEnv extends EnvWithDurableObjects
 > = TInputProps & BaseActorKitInput<TEnv>;
 
-export type AnyActorKitStateMachine = ActorKitStateMachine<any, any, any>;
+/**
+ * Any actor-kit compatible state machine.
+ * Alias for AnyStateMachine — actor-kit accepts any xstate machine
+ * whose context has public/private structure.
+ */
+export type AnyActorKitStateMachine = AnyStateMachine;
 
 type AnyActorKitEvent = (
   | WithActorKitEvent<AnyEventObject, "client">
@@ -194,45 +200,30 @@ export type CallerSnapshotFrom<TMachine extends AnyStateMachine> = {
   value: SnapshotFrom<TMachine> extends { value: infer V } ? V : unknown;
 };
 
-export type ClientEventFrom<T extends AnyActorKitStateMachine> =
-  T extends StateMachine<
-    any,
-    infer TEvent,
-    any,
-    any,
-    any,
-    any,
-    any,
-    any,
-    any,
-    any,
-    any,
-    any,
-    any,
-    any
-  >
+/**
+ * Extract client events from a machine type.
+ * Uses EventFromLogic (interface-based) instead of StateMachine (class-based)
+ * to avoid nominal typing issues when xstate is resolved from different paths.
+ * Supports both actor-kit wrapped events (WithActorKitEvent<E, "client">)
+ * and plain xstate machines where the event type is used directly.
+ */
+export type ClientEventFrom<T extends AnyStateMachine> =
+  EventFromLogic<T> extends infer TEvent
     ? TEvent extends WithActorKitEvent<infer E, "client">
       ? Omit<E, keyof BaseActorKitEvent<EnvWithDurableObjects>>
-      : never
+      : Omit<TEvent, keyof BaseActorKitEvent<EnvWithDurableObjects>>
     : never;
 
-export type ServiceEventFrom<T extends AnyActorKitStateMachine> =
-  T extends StateMachine<
-    any,
-    infer TEvent,
-    any,
-    any,
-    any,
-    any,
-    any,
-    any,
-    any,
-    any,
-    any,
-    any,
-    any,
-    any
-  >
+/**
+ * Extract service events from a machine type.
+ * Uses EventFromLogic (interface-based) instead of StateMachine (class-based)
+ * to avoid nominal typing issues when xstate is resolved from different paths.
+ * Supports both actor-kit wrapped events (WithActorKitEvent<E, "service">)
+ * and plain xstate machines (falls back to never since plain machines
+ * don't distinguish client vs service events).
+ */
+export type ServiceEventFrom<T extends AnyStateMachine> =
+  EventFromLogic<T> extends infer TEvent
     ? TEvent extends WithActorKitEvent<infer E, "service">
       ? Omit<E, keyof BaseActorKitEvent<EnvWithDurableObjects>>
       : never
@@ -244,7 +235,7 @@ export type ScreamingSnakeToKebab<S extends string> =
     ? `${Lowercase<T>}-${ScreamingSnakeToKebab<U>}`
     : Lowercase<S>;
 
-export type DurableObjectActor<TMachine extends AnyActorKitStateMachine> =
+export type DurableObjectActor<TMachine extends AnyStateMachine> =
   ActorServer<TMachine>;
 
 type CamelToSnakeCase<S extends string> = S extends `${infer T}${infer U}`
@@ -260,7 +251,7 @@ type KebabToCamelCase<S extends string> = S extends `${infer T}-${infer U}`
 export type KebabToScreamingSnake<S extends string> = Uppercase<
   CamelToSnakeCase<KebabToCamelCase<S>>
 >;
-export interface MatchesProps<TMachine extends AnyActorKitStateMachine> {
+export interface MatchesProps<TMachine extends AnyStateMachine> {
   state: StateValueFrom<TMachine>;
   and?: StateValueFrom<TMachine>;
   or?: StateValueFrom<TMachine>;
@@ -279,7 +270,7 @@ export type ActorKitEmittedEvent = {
 //     checksum: string;
 //   };
 
-export type ActorKitClient<TMachine extends AnyActorKitStateMachine> = {
+export type ActorKitClient<TMachine extends AnyStateMachine> = {
   connect: () => Promise<void>;
   disconnect: () => void;
   send: (event: ClientEventFrom<TMachine>) => void;
@@ -306,7 +297,7 @@ type ExtractEventType<TMachine> = TMachine extends ActorKitStateMachine<
 type ExtractEnvType<TEvent> = TEvent extends { env: infer TEnv } ? TEnv : never;
 
 // Finally, our InferEnvFromMachine type that ensures EnvWithDurableObjects
-export type EnvFromMachine<TMachine extends AnyActorKitStateMachine> =
+export type EnvFromMachine<TMachine extends AnyStateMachine> =
   ExtractEnvType<ExtractEventType<TMachine>> extends never
     ? EnvWithDurableObjects
     : ExtractEnvType<ExtractEventType<TMachine>> & EnvWithDurableObjects;

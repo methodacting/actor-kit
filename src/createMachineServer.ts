@@ -4,6 +4,7 @@ import { compare } from "fast-json-patch";
 import {
   Actor,
   AnyEventObject,
+  AnyStateMachine,
   createActor,
   InputFrom,
   matchesState,
@@ -17,8 +18,6 @@ import { AlarmTypes, PERSISTED_SNAPSHOT_KEY } from "./constants";
 import { CallerSchema } from "./schemas";
 import {
   ActorKitInputProps,
-  ActorKitStateMachine,
-  ActorKitSystemEvent,
   ActorServer,
   Caller,
   CallerSnapshotFrom,
@@ -26,8 +25,6 @@ import {
   EnvFromMachine,
   MachineServerOptions,
   ServiceEventFrom,
-  WithActorKitContext,
-  WithActorKitEvent,
 } from "./types";
 import { ActorKitStorage } from "./storage";
 import { AlarmManager, generateAlarmId } from "./alarms";
@@ -43,7 +40,7 @@ const StorageSchema = z.object({
   actorType: z.string(),
   actorId: z.string(),
   initialCaller: CallerSchema,
-  input: z.record(z.unknown()),
+  input: z.record(z.string(), z.unknown()),
 });
 
 const WebSocketAttachmentSchema = z.object({
@@ -56,26 +53,19 @@ type WebSocketAttachment = z.infer<typeof WebSocketAttachmentSchema>;
  * Creates a MachineServer class that extends DurableObject and implements ActorServer.
  * This function is the main entry point for creating a machine server.
  */
+/** Structural type for a Zod-like schema — avoids nominal Zod class types that break across pnpm boundaries */
+type EventSchema<T extends { type: string } = { type: string }> = {
+  parse(data: unknown): T;
+};
+
+type InputSchema<T extends Record<string, unknown> = Record<string, unknown>> = {
+  parse(data: unknown): T;
+};
+
 export const createMachineServer = <
-  TClientEvent extends AnyEventObject,
-  TServiceEvent extends AnyEventObject,
-  TInputSchema extends z.ZodObject<z.ZodRawShape>,
-  TMachine extends ActorKitStateMachine<
-    (
-      | WithActorKitEvent<TClientEvent, "client">
-      | WithActorKitEvent<TServiceEvent, "service">
-      | ActorKitSystemEvent
-    ) & {
-      storage: DurableObjectStorage;
-      env: EnvFromMachine<TMachine>;
-    },
-    z.infer<TInputSchema> & {
-      id: string;
-      caller: Caller;
-      storage: DurableObjectStorage;
-    },
-    WithActorKitContext<any, any, any>
-  >
+  TClientEvent extends { type: string },
+  TServiceEvent extends { type: string },
+  TMachine extends AnyStateMachine
 >({
   machine,
   schemas,
@@ -83,9 +73,9 @@ export const createMachineServer = <
 }: {
   machine: TMachine;
   schemas: {
-    clientEvent: z.ZodSchema<TClientEvent>;
-    serviceEvent: z.ZodSchema<TServiceEvent>;
-    inputProps: TInputSchema;
+    clientEvent: EventSchema<TClientEvent>;
+    serviceEvent: EventSchema<TServiceEvent>;
+    inputProps: InputSchema;
   };
   options?: MachineServerOptions;
 }): new (
@@ -455,7 +445,7 @@ export const createMachineServer = <
         event = {
           ...clientEvent,
           caller,
-        } as ClientEventFrom<TMachine>;
+        } as unknown as ClientEventFrom<TMachine>;
       } else if (caller.type === "service") {
         const serviceEvent = schemas.serviceEvent.parse(
           JSON.parse(message as string)
@@ -463,7 +453,7 @@ export const createMachineServer = <
         event = {
           ...serviceEvent,
           caller,
-        } as ServiceEventFrom<TMachine>;
+        } as unknown as ServiceEventFrom<TMachine>;
       } else {
         throw new Error(`Unknown caller type: ${caller.type}`);
       }
@@ -511,7 +501,7 @@ export const createMachineServer = <
         ...event,
         env: this.env,
         storage: this.storage,
-      });
+      } as Parameters<typeof this.actor.send>[0]);
     }
 
     /**

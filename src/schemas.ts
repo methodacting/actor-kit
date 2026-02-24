@@ -7,7 +7,7 @@ export const BotManagementSchema = z.object({
     passed: z.boolean(),
   }),
   staticResource: z.boolean(),
-  detectionIds: z.record(z.any()),
+  detectionIds: z.record(z.string(), z.any()),
   score: z.number(),
 });
 
@@ -75,7 +75,10 @@ export const CallerStringSchema = z.string().transform((val, ctx) => {
   // Regular expression to validate the UUID format
   const callerTypeParseResult = CallerIdTypeSchema.safeParse(val.split("-")[0]);
   if (!callerTypeParseResult.success) {
-    callerTypeParseResult.error.issues.forEach(ctx.addIssue);
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: `Invalid caller type: ${val.split("-")[0]}`,
+    });
     return z.NEVER;
   }
   const type = callerTypeParseResult.data;
