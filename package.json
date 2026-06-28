@@ -46,7 +46,7 @@
     "test": "pnpm run test:unit",
     "test:unit": "vitest run",
     "test:integration": "vitest run --config vitest.integration.config.ts",
-    "test:build-fixtures": "npx wrangler deploy --dry-run --outdir=dist --config tests/integration/fixtures/wrangler.toml",
+    "test:build-fixtures": "npx wrangler deploy --dry-run --outdir=dist --config tests/integration/fixtures/wrangler.toml && npx wrangler deploy --dry-run --outdir=dist-sqlite --config tests/integration/fixtures/wrangler-sqlite.toml",
     "test:coverage": "vitest run --coverage",
     "test:mutate": "NODE_OPTIONS=--max-old-space-size=8192 stryker run",
     "test:mutate:incremental": "NODE_OPTIONS=--max-old-space-size=8192 stryker run --incremental",

@@ -31,6 +31,17 @@ import type {
   WithActorKitEvent,
 } from "./types";
 import { assert, getCallerFromRequest } from "./utils";
+import { SqliteStorage } from "./sqlite";
+import { AlarmManager } from "./alarms";
+import type { Alarm } from "./alarms";
+import { EventLog, restoreEventSequence } from "./event-log";
+import {
+  createAlarmScheduler,
+  handleXStateAlarm,
+  restoreScheduledEvents,
+  NOOP_CLOCK,
+  type XStateAlarmData,
+} from "./durable-object-system";
 
 const StorageSchema = z.object({
   actorType: z.string(),
@@ -143,48 +154,109 @@ export const createMachineServer = <
     env: EnvFromMachine<TMachine>;
     currentChecksum: string | null = null;
 
+    // SQLite storage layer
+    sqliteStorage: SqliteStorage | null = null;
+    alarmManager: AlarmManager | null = null;
+    eventLog: EventLog | null = null;
+
     constructor(state: DurableObjectState, env: EnvFromMachine<TMachine>) {
       super(state, env);
       this.state = state;
       this.storage = state.storage;
       this.env = env;
 
+      // Initialize SQLite storage if sqlite options or alarms are configured
+      if (options?.sqlite || options?.enableAlarms) {
+        this.sqliteStorage = new SqliteStorage(this.storage);
+        this.sqliteStorage.ensureInitialized();
+
+        if (options.enableAlarms) {
+          this.alarmManager = new AlarmManager(this.sqliteStorage, this.state);
+        }
+
+        if (options.sqlite) {
+          const initialSeq = restoreEventSequence(this.sqliteStorage);
+          this.eventLog = new EventLog(
+            this.sqliteStorage,
+            options.sqlite,
+            initialSeq
+          );
+        }
+      }
+
       this.state.blockConcurrencyWhile(async () => {
-        const [actorType, actorId, initialCallerString, inputString] =
-          await Promise.all([
-            this.storage.get("actorType"),
-            this.storage.get("actorId"),
-            this.storage.get("initialCaller"),
-            this.storage.get("input"),
-          ]);
+        // Try SQLite first, fall back to KV
+        let loaded = false;
+        if (this.sqliteStorage) {
+          // Attempt KV→SQLite migration on first boot
+          await this.sqliteStorage.migrateFromKVAsync(this.storage);
 
-        if (actorType && actorId && initialCallerString && inputString) {
-          try {
-            const parsedData = StorageSchema.parse({
-              actorType,
-              actorId,
-              initialCaller: parseStoredJson(initialCallerString, CallerSchema),
-              input: parseStoredJson(inputString, z.record(z.unknown())),
-            });
+          const meta = this.sqliteStorage.getActorMeta();
+          if (meta) {
+            this.actorType = meta.actorType;
+            this.actorId = meta.actorId;
+            this.initialCaller = meta.initialCaller;
+            this.input = meta.input;
+            loaded = true;
+          }
+        }
 
-            this.actorType = parsedData.actorType;
-            this.actorId = parsedData.actorId;
-            this.initialCaller = parsedData.initialCaller;
-            this.input = parsedData.input;
+        if (!loaded) {
+          // Legacy KV path
+          const [actorType, actorId, initialCallerString, inputString] =
+            await Promise.all([
+              this.storage.get("actorType"),
+              this.storage.get("actorId"),
+              this.storage.get("initialCaller"),
+              this.storage.get("input"),
+            ]);
 
-            if (options?.persisted) {
-              const persistedSnapshot = await this.loadPersistedSnapshot();
-              if (persistedSnapshot) {
-                this.restorePersistedActor(persistedSnapshot);
-              } else {
-                this.#ensureActorRunning();
-              }
+          if (actorType && actorId && initialCallerString && inputString) {
+            try {
+              const parsedData = StorageSchema.parse({
+                actorType,
+                actorId,
+                initialCaller: parseStoredJson(initialCallerString, CallerSchema),
+                input: parseStoredJson(inputString, z.record(z.unknown())),
+              });
+
+              this.actorType = parsedData.actorType;
+              this.actorId = parsedData.actorId;
+              this.initialCaller = parsedData.initialCaller;
+              this.input = parsedData.input;
+              loaded = true;
+            } catch {
+              // Ignore corrupt startup state and wait for a fresh spawn.
+            }
+          }
+        }
+
+        if (loaded) {
+          if (options?.persisted) {
+            const persistedSnapshot = await this.loadPersistedSnapshot();
+            if (persistedSnapshot) {
+              this.restorePersistedActor(persistedSnapshot);
             } else {
               this.#ensureActorRunning();
             }
-          } catch {
-            // Ignore corrupt startup state and wait for a fresh spawn.
+          } else {
+            this.#ensureActorRunning();
           }
+        }
+
+        // Restore alarm scheduler state after hibernation
+        if (this.alarmManager) {
+          const alarms = this.alarmManager.getPendingAlarms();
+          const xstateAlarms = alarms
+            .filter((a) => a.type === "xstate-delay" && a.payload)
+            .map((a) => ({
+              payload: a.payload as unknown as XStateAlarmData,
+              scheduledAt: a.scheduledAt,
+            }));
+          if (xstateAlarms.length > 0) {
+            restoreScheduledEvents(xstateAlarms);
+          }
+          this.alarmManager.rescheduleNextAlarm();
         }
 
         for (const socket of this.state.getWebSockets()) {
@@ -213,6 +285,11 @@ export const createMachineServer = <
         this.actor = createActor(machine, {
           input: input as InputFrom<TMachine>,
         });
+
+        if (this.alarmManager && this.actor.system) {
+          (this.actor.system as unknown as { scheduler: unknown }).scheduler =
+            createAlarmScheduler(this.alarmManager, this.actor.system);
+        }
 
         if (options?.persisted) {
           this.#setupStatePersistence(this.actor);
@@ -318,7 +395,16 @@ export const createMachineServer = <
         return;
       }
 
-      await this.storage.put(PERSISTED_SNAPSHOT_KEY, JSON.stringify(snapshot));
+      const data = JSON.stringify(snapshot);
+
+      if (this.sqliteStorage) {
+        const checksum = await this.#calculateChecksum(snapshot);
+        const seq = this.eventLog?.getSequence() ?? 0;
+        this.sqliteStorage.insertSnapshot(seq, data, checksum);
+      } else {
+        await this.storage.put(PERSISTED_SNAPSHOT_KEY, data);
+      }
+
       this.lastPersistedSnapshot = snapshot;
     }
 
@@ -392,12 +478,21 @@ export const createMachineServer = <
       caller: Caller,
       input: Record<string, unknown>
     ) {
-      await Promise.all([
-        this.storage.put("actorType", actorType),
-        this.storage.put("actorId", actorId),
-        this.storage.put("initialCaller", JSON.stringify(caller)),
-        this.storage.put("input", JSON.stringify(input)),
-      ]);
+      if (this.sqliteStorage) {
+        this.sqliteStorage.setActorMeta({
+          actorId,
+          actorType,
+          initialCaller: caller,
+          input,
+        });
+      } else {
+        await Promise.all([
+          this.storage.put("actorType", actorType),
+          this.storage.put("actorId", actorId),
+          this.storage.put("initialCaller", JSON.stringify(caller)),
+          this.storage.put("input", JSON.stringify(input)),
+        ]);
+      }
     }
 
     #isActorRunning() {
@@ -498,11 +593,40 @@ export const createMachineServer = <
 
     send(event: ClientEventFrom<TMachine> | ServiceEventFrom<TMachine>) {
       assert(this.actor, "Actor is not running");
+
+      const seq = this.eventLog ? this.eventLog.nextSequence() : 0;
+      const timestamp = Date.now();
+      const startTime = performance.now();
+
       this.actor.send({
         ...event,
         env: this.env,
         storage: this.storage,
+        _timestamp: timestamp,
+        _seq: seq,
       });
+
+      // Record event to log after transition
+      if (this.eventLog && this.actor) {
+        const durationMs = performance.now() - startTime;
+        const snapshot = this.actor.getSnapshot();
+        const snapshotValue = (snapshot as unknown as { value: unknown }).value;
+
+        // Calculate checksum asynchronously — fire and forget for the log
+        this.#calculateChecksum(snapshot).then((checksum) => {
+          const caller = (event as unknown as { caller?: Caller }).caller;
+          this.eventLog?.recordEvent({
+            type: (event as unknown as { type: string }).type,
+            caller: caller ?? { id: "unknown", type: "system" },
+            payload: event as unknown as Record<string, unknown>,
+            stateValue: snapshotValue,
+            checksum,
+            durationMs,
+          });
+        }).catch(() => {
+          // Event logging errors are non-fatal
+        });
+      }
     }
 
     async getSnapshot(
@@ -656,6 +780,16 @@ export const createMachineServer = <
     }
 
     async loadPersistedSnapshot(): Promise<SnapshotFrom<TMachine> | null> {
+      // Try SQLite first
+      if (this.sqliteStorage) {
+        const row = this.sqliteStorage.getLatestSnapshot();
+        if (row) {
+          return JSON.parse(row.data) as SnapshotFrom<TMachine>;
+        }
+        return null;
+      }
+
+      // Fall back to KV
       const snapshotString = await this.storage.get(PERSISTED_SNAPSHOT_KEY);
       return snapshotString
         ? (JSON.parse(z.string().parse(snapshotString)) as SnapshotFrom<TMachine>)
@@ -691,6 +825,11 @@ export const createMachineServer = <
         input,
       });
 
+      if (this.alarmManager && this.actor.system) {
+        (this.actor.system as unknown as { scheduler: unknown }).scheduler =
+          createAlarmScheduler(this.alarmManager, this.actor.system);
+      }
+
       if (options?.persisted) {
         this.#setupStatePersistence(this.actor);
       }
@@ -704,5 +843,21 @@ export const createMachineServer = <
       } as EventFromLogic<TMachine>);
 
       this.lastPersistedSnapshot = restoredSnapshot as SnapshotFrom<TMachine>;
+    }
+
+    /**
+     * Durable Object alarm handler.
+     * Processes due alarms (XState delayed events, custom alarms).
+     */
+    async alarm() {
+      if (!this.alarmManager) return;
+
+      this.alarmManager.handleDueAlarms((alarm: Alarm) => {
+        if (alarm.type === "xstate-delay" && this.actor) {
+          const alarmData = alarm.payload as unknown as XStateAlarmData;
+          handleXStateAlarm(alarmData, this.actor as unknown as Parameters<typeof handleXStateAlarm>[1]);
+        }
+        // Custom alarm types can be handled by extending this
+      });
     }
   };

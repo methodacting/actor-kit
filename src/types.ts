@@ -156,9 +156,22 @@ export type BaseActorKitStateMachine = ActorKitStateMachine<
   AnyActorKitContext
 >;
 
-export type MachineServerOptions = {
+export interface SqliteOptions {
+  /** Enable event logging to SQLite (default: false) */
+  eventLog?: boolean;
+  /** Maximum number of events to keep (rolling window, 0 = unlimited) */
+  maxEvents?: number;
+  /** Fields to strip from logged event payloads */
+  redact?: string[];
+}
+
+export interface MachineServerOptions {
   persisted?: boolean;
-};
+  /** SQLite event log options */
+  sqlite?: SqliteOptions;
+  /** Enable alarm-based scheduling for XState delayed events (default: false) */
+  enableAlarms?: boolean;
+}
 
 export type ExtraContext = {
   requestId: string;
@@ -169,6 +182,10 @@ export interface BaseActorKitEvent<TEnv extends ActorKitEnv = ActorKitEnv> {
   storage: ActorKitStorage;
   requestInfo?: RequestInfo;
   env: TEnv;
+  /** Server-injected timestamp (always authoritative, overwrites client-provided values) */
+  _timestamp?: number;
+  /** Server-injected monotonically increasing sequence number */
+  _seq?: number;
 }
 
 export type ActorKitSystemEvent = z.infer<typeof SystemEventSchema>;

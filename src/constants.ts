@@ -19,3 +19,12 @@ export const CallerTypes: Record<CallerType, CallerType> = {
 };
 
 export const PERSISTED_SNAPSHOT_KEY = "persistedSnapshot";
+
+/**
+ * Alarm types supported by the alarm system
+ */
+export const AlarmTypes = {
+  "xstate-delay": "xstate-delay",
+  "cache-cleanup": "cache-cleanup",
+  custom: "custom",
+} as const;
