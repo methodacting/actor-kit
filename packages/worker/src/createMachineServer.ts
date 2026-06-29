@@ -27,6 +27,15 @@ import {
   type ServiceEventFrom,
 } from "@actor-kit/types";
 import { assert, getCallerFromRequest } from "./utils";
+import { SqliteStorage } from "./sqlite";
+import { AlarmManager, type Alarm } from "./alarms";
+import { EventLog, restoreEventSequence } from "./event-log";
+import {
+  createAlarmScheduler,
+  handleXStateAlarm,
+  restoreScheduledEvents,
+  type XStateAlarmData,
+} from "./durable-object-system";
 
 const StorageSchema = z.object({
   actorType: z.string(),
@@ -124,48 +133,109 @@ export const createMachineServer = <
     env: EnvFromMachine<TMachine>;
     currentChecksum: string | null = null;
 
+    // SQLite storage layer: structured storage + hibernation-safe alarms + event log.
+    // Allocated only when `options.sqlite` or `options.enableAlarms` is set; otherwise
+    // the server keeps its original KV + in-memory-scheduler behaviour untouched.
+    sqliteStorage: SqliteStorage | null = null;
+    alarmManager: AlarmManager | null = null;
+    eventLog: EventLog | null = null;
+
     constructor(state: DurableObjectState, env: EnvFromMachine<TMachine>) {
       super(state, env);
       this.state = state;
       this.storage = state.storage;
       this.env = env;
 
+      if (options?.sqlite || options?.enableAlarms) {
+        this.sqliteStorage = new SqliteStorage(this.storage);
+        this.sqliteStorage.ensureInitialized();
+
+        if (options.enableAlarms) {
+          this.alarmManager = new AlarmManager(this.sqliteStorage, this.state);
+        }
+
+        if (options.sqlite) {
+          const initialSeq = restoreEventSequence(this.sqliteStorage);
+          this.eventLog = new EventLog(
+            this.sqliteStorage,
+            options.sqlite,
+            initialSeq
+          );
+        }
+      }
+
       this.state.blockConcurrencyWhile(async () => {
-        const [actorType, actorId, initialCallerString, inputString] =
-          await Promise.all([
-            this.storage.get("actorType"),
-            this.storage.get("actorId"),
-            this.storage.get("initialCaller"),
-            this.storage.get("input"),
-          ]);
+        let loaded = false;
 
-        if (actorType && actorId && initialCallerString && inputString) {
-          try {
-            const parsedData = StorageSchema.parse({
-              actorType,
-              actorId,
-              initialCaller: parseStoredJson(initialCallerString, CallerSchema),
-              input: parseStoredJson(inputString, z.record(z.unknown())),
-            });
+        if (this.sqliteStorage) {
+          // Migrate any legacy KV metadata on first boot, then load from SQLite.
+          await this.sqliteStorage.migrateFromKVAsync(this.storage);
+          const meta = this.sqliteStorage.getActorMeta();
+          if (meta) {
+            this.actorType = meta.actorType;
+            this.actorId = meta.actorId;
+            this.initialCaller = meta.initialCaller;
+            this.input = meta.input;
+            loaded = true;
+          }
+        }
 
-            this.actorType = parsedData.actorType;
-            this.actorId = parsedData.actorId;
-            this.initialCaller = parsedData.initialCaller;
-            this.input = parsedData.input;
+        if (!loaded) {
+          const [actorType, actorId, initialCallerString, inputString] =
+            await Promise.all([
+              this.storage.get("actorType"),
+              this.storage.get("actorId"),
+              this.storage.get("initialCaller"),
+              this.storage.get("input"),
+            ]);
 
-            if (options?.persisted) {
-              const persistedSnapshot = await this.loadPersistedSnapshot();
-              if (persistedSnapshot) {
-                this.restorePersistedActor(persistedSnapshot);
-              } else {
-                this.#ensureActorRunning();
-              }
+          if (actorType && actorId && initialCallerString && inputString) {
+            try {
+              const parsedData = StorageSchema.parse({
+                actorType,
+                actorId,
+                initialCaller: parseStoredJson(initialCallerString, CallerSchema),
+                input: parseStoredJson(inputString, z.record(z.unknown())),
+              });
+
+              this.actorType = parsedData.actorType;
+              this.actorId = parsedData.actorId;
+              this.initialCaller = parsedData.initialCaller;
+              this.input = parsedData.input;
+              loaded = true;
+            } catch {
+              // Ignore corrupt startup state and wait for a fresh spawn.
+            }
+          }
+        }
+
+        if (loaded) {
+          if (options?.persisted) {
+            const persistedSnapshot = await this.loadPersistedSnapshot();
+            if (persistedSnapshot) {
+              this.restorePersistedActor(persistedSnapshot);
             } else {
               this.#ensureActorRunning();
             }
-          } catch {
-            // Ignore corrupt startup state and wait for a fresh spawn.
+          } else {
+            this.#ensureActorRunning();
           }
+        }
+
+        // After hibernation, rehydrate the in-memory scheduler map from the
+        // persisted alarms and re-arm the earliest DO alarm.
+        if (this.alarmManager) {
+          const xstateAlarms = this.alarmManager
+            .getPendingAlarms()
+            .filter((a) => a.type === "xstate-delay" && a.payload)
+            .map((a) => ({
+              payload: a.payload as unknown as XStateAlarmData,
+              scheduledAt: a.scheduledAt,
+            }));
+          if (xstateAlarms.length > 0) {
+            restoreScheduledEvents(xstateAlarms);
+          }
+          this.alarmManager.rescheduleNextAlarm();
         }
 
         for (const socket of this.state.getWebSockets()) {
@@ -195,6 +265,8 @@ export const createMachineServer = <
           input: input as InputFrom<TMachine>,
         });
 
+        this.#installAlarmScheduler(this.actor);
+
         if (options?.persisted) {
           this.#setupStatePersistence(this.actor);
         }
@@ -203,6 +275,18 @@ export const createMachineServer = <
       }
 
       return this.actor;
+    }
+
+    /**
+     * Replace XState's default (setTimeout-based) scheduler with the alarm-backed
+     * one so `after` delays and delayed `raise` persist as DO alarms and survive
+     * hibernation. No-op unless alarms are enabled.
+     */
+    #installAlarmScheduler(actor: Actor<TMachine>) {
+      if (this.alarmManager && actor.system) {
+        (actor.system as unknown as { scheduler: unknown }).scheduler =
+          createAlarmScheduler(this.alarmManager, actor.system);
+      }
     }
 
     #subscribeSocketToActor(ws: WebSocket) {
@@ -299,7 +383,16 @@ export const createMachineServer = <
         return;
       }
 
-      await this.storage.put(PERSISTED_SNAPSHOT_KEY, JSON.stringify(snapshot));
+      const data = JSON.stringify(snapshot);
+
+      if (this.sqliteStorage) {
+        const checksum = await this.#calculateChecksum(snapshot);
+        const seq = this.eventLog?.getSequence() ?? 0;
+        this.sqliteStorage.insertSnapshot(seq, data, checksum);
+      } else {
+        await this.storage.put(PERSISTED_SNAPSHOT_KEY, data);
+      }
+
       this.lastPersistedSnapshot = snapshot;
     }
 
@@ -373,6 +466,16 @@ export const createMachineServer = <
       caller: Caller,
       input: Record<string, unknown>
     ) {
+      if (this.sqliteStorage) {
+        this.sqliteStorage.setActorMeta({
+          actorId,
+          actorType,
+          initialCaller: caller,
+          input,
+        });
+        return;
+      }
+
       await Promise.all([
         this.storage.put("actorType", actorType),
         this.storage.put("actorId", actorId),
@@ -479,11 +582,42 @@ export const createMachineServer = <
 
     send(event: ClientEventFrom<TMachine> | ServiceEventFrom<TMachine>) {
       assert(this.actor, "Actor is not running");
+
+      const seq = this.eventLog ? this.eventLog.nextSequence() : 0;
+      const timestamp = Date.now();
+      const startTime = performance.now();
+
       this.actor.send({
         ...event,
         env: this.env,
         storage: this.storage,
+        _timestamp: timestamp,
+        _seq: seq,
       });
+
+      // Record the event to the SQLite log after the transition. Checksum is
+      // computed async; fire-and-forget so it never blocks the send path.
+      if (this.eventLog && this.actor) {
+        const durationMs = performance.now() - startTime;
+        const snapshot = this.actor.getSnapshot();
+        const snapshotValue = (snapshot as unknown as { value: unknown }).value;
+
+        this.#calculateChecksum(snapshot)
+          .then((checksum) => {
+            const caller = (event as unknown as { caller?: Caller }).caller;
+            this.eventLog?.recordEvent({
+              type: (event as unknown as { type: string }).type,
+              caller: caller ?? { id: "unknown", type: "system" },
+              payload: event as unknown as Record<string, unknown>,
+              stateValue: snapshotValue,
+              checksum,
+              durationMs,
+            });
+          })
+          .catch(() => {
+            // Event logging errors are non-fatal.
+          });
+      }
     }
 
     async getSnapshot(
@@ -637,6 +771,11 @@ export const createMachineServer = <
     }
 
     async loadPersistedSnapshot(): Promise<SnapshotFrom<TMachine> | null> {
+      if (this.sqliteStorage) {
+        const row = this.sqliteStorage.getLatestSnapshot();
+        return row ? (JSON.parse(row.data) as SnapshotFrom<TMachine>) : null;
+      }
+
       const snapshotString = await this.storage.get(PERSISTED_SNAPSHOT_KEY);
       return snapshotString
         ? (JSON.parse(z.string().parse(snapshotString)) as SnapshotFrom<TMachine>)
@@ -672,6 +811,8 @@ export const createMachineServer = <
         input,
       });
 
+      this.#installAlarmScheduler(this.actor);
+
       if (options?.persisted) {
         this.#setupStatePersistence(this.actor);
       }
@@ -685,5 +826,25 @@ export const createMachineServer = <
       } as EventFromLogic<TMachine>);
 
       this.lastPersistedSnapshot = restoredSnapshot as SnapshotFrom<TMachine>;
+    }
+
+    /**
+     * Durable Object alarm handler. Delivers due XState delayed events back into
+     * the actor (and re-arms the next alarm via the AlarmManager). No-op unless
+     * alarms are enabled.
+     */
+    async alarm() {
+      if (!this.alarmManager) return;
+
+      this.alarmManager.handleDueAlarms((alarm: Alarm) => {
+        if (alarm.type === "xstate-delay" && this.actor) {
+          const alarmData = alarm.payload as unknown as XStateAlarmData;
+          handleXStateAlarm(
+            alarmData,
+            this.actor as unknown as Parameters<typeof handleXStateAlarm>[1]
+          );
+        }
+        // Custom alarm types can be handled by extending this.
+      });
     }
   };
