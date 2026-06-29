@@ -19,3 +19,14 @@ export const CallerTypes: Record<CallerType, CallerType> = {
 };
 
 export const PERSISTED_SNAPSHOT_KEY = "persistedSnapshot";
+
+/**
+ * Alarm types supported by the alarm-based scheduler. `xstate-delay` carries a
+ * machine's delayed event; `cache-cleanup` is the recurring snapshot-cache prune;
+ * `custom` is for application-defined scheduled work.
+ */
+export const AlarmTypes = {
+  "xstate-delay": "xstate-delay",
+  "cache-cleanup": "cache-cleanup",
+  custom: "custom",
+} as const;

@@ -209,6 +209,122 @@ export const Aggregator = createMachineServer({
 });
 
 // ============================================================================
+// Timer DO — exercises the SQLite storage layer: event log, SQLite snapshots,
+// and a hibernation-safe `after` delay driven by the alarm scheduler.
+// ============================================================================
+
+const TimerClientEventSchema = z.discriminatedUnion("type", [
+  z.object({ type: z.literal("INCREMENT") }),
+  z.object({ type: z.literal("START_TIMER") }),
+]);
+
+const TimerServiceEventSchema = z.discriminatedUnion("type", [
+  z.object({ type: z.literal("NOOP") }),
+]);
+
+const TimerInputPropsSchema = z.object({});
+
+type TimerClientEvent = z.infer<typeof TimerClientEventSchema>;
+type TimerServiceEvent = z.infer<typeof TimerServiceEventSchema>;
+
+type TimerEvent = (
+  | WithActorKitEvent<TimerClientEvent, "client">
+  | WithActorKitEvent<TimerServiceEvent, "service">
+  | ActorKitSystemEvent
+) &
+  BaseActorKitEvent<Env>;
+
+type TimerInput = WithActorKitInput<z.infer<typeof TimerInputPropsSchema>, Env>;
+
+type TimerServerContext = {
+  public: { count: number; rang: boolean };
+  private: Record<string, never>;
+};
+
+// The delay is short so the test only waits a beat; what matters is that it's
+// scheduled as a *persisted DO alarm* (SQLite), not an in-memory setTimeout.
+const TIMER_DELAY_MS = 50;
+
+const timerMachine = setup({
+  types: {
+    context: {} as TimerServerContext,
+    events: {} as TimerEvent,
+    input: {} as TimerInput,
+  },
+  delays: { tick: TIMER_DELAY_MS },
+  actions: {
+    increment: assign({
+      public: ({ context }) => ({ ...context.public, count: context.public.count + 1 }),
+    }),
+    ring: assign({
+      public: ({ context }) => ({ ...context.public, rang: true }),
+    }),
+  },
+}).createMachine({
+  id: "timer",
+  initial: "idle",
+  context: () => ({ public: { count: 0, rang: false }, private: {} }),
+  states: {
+    idle: {
+      on: {
+        INCREMENT: { actions: "increment" },
+        START_TIMER: "ticking",
+      },
+    },
+    ticking: {
+      after: { tick: { target: "rang", actions: "ring" } },
+    },
+    rang: { type: "final" },
+  },
+});
+
+export type TimerMachine = typeof timerMachine;
+
+const TimerServer = createMachineServer({
+  machine: timerMachine,
+  schemas: {
+    clientEvent: TimerClientEventSchema,
+    serviceEvent: TimerServiceEventSchema,
+    inputProps: TimerInputPropsSchema,
+  },
+  options: { persisted: true, sqlite: { eventLog: true }, enableAlarms: true },
+});
+
+/** Internals exposed by the SQLite layer, for test inspection only. */
+interface TimerInternals {
+  sqliteStorage: {
+    getEvents(): unknown[];
+    getLatestSnapshot(): unknown;
+  } | null;
+  alarmManager: {
+    getPendingAlarms(): { type: string }[];
+  } | null;
+}
+
+/**
+ * Subclass adds RPC inspection methods. The SQLite fields are public on the
+ * machine-server impl but erased to `ActorServer` in the public type, so we
+ * reach them through a narrow internal cast (test-only).
+ */
+export class Timer extends TimerServer {
+  /** Number of client/service events recorded to the SQLite event log. */
+  getEventCount(): number {
+    const s = (this as unknown as TimerInternals).sqliteStorage;
+    return s ? s.getEvents().length : 0;
+  }
+  /** Whether a snapshot row has been persisted to SQLite. */
+  hasPersistedSnapshot(): boolean {
+    const s = (this as unknown as TimerInternals).sqliteStorage;
+    return s ? s.getLatestSnapshot() != null : false;
+  }
+  /** Count of pending `xstate-delay` alarms persisted in SQLite. */
+  pendingXStateAlarms(): number {
+    const a = (this as unknown as TimerInternals).alarmManager;
+    return a ? a.getPendingAlarms().filter((x) => x.type === "xstate-delay").length : 0;
+  }
+}
+
+// ============================================================================
 // Worker entrypoint
 // ============================================================================
 
