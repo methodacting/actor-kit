@@ -606,6 +606,7 @@ export const createMachineServer = <
           .then((checksum) => {
             const caller = (event as unknown as { caller?: Caller }).caller;
             this.eventLog?.recordEvent({
+              seq,
               type: (event as unknown as { type: string }).type,
               caller: caller ?? { id: "unknown", type: "system" },
               payload: event as unknown as Record<string, unknown>,

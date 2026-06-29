@@ -265,8 +265,12 @@ export class SqliteStorage {
 
   getLatestSnapshot(): { data: string; seq: number; checksum: string } | null {
     this.ensureInitialized();
+    // `id DESC` is the tie-breaker: when there's no sequence source (alarms-only,
+    // no event log) every snapshot is written with seq 0, so ordering by seq
+    // alone is non-deterministic and could restore an older snapshot. The
+    // autoincrement id reflects true write order.
     const rows = this.queryRows<SnapshotRecord>(
-      "SELECT id, seq, timestamp, checksum, data FROM snapshots ORDER BY seq DESC LIMIT 1"
+      "SELECT id, seq, timestamp, checksum, data FROM snapshots ORDER BY seq DESC, id DESC LIMIT 1"
     );
     if (rows.length === 0) return null;
     return { data: rows[0].data, seq: rows[0].seq, checksum: rows[0].checksum };

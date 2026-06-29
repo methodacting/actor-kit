@@ -144,22 +144,80 @@ export function createAlarmScheduler(
 }
 
 /**
+ * Minimal actor-ref shape we rely on to route a delayed event. Matches XState's
+ * `ActorRefLike` plus the optional `system` for relaying.
+ */
+interface RoutableActorRef {
+  sessionId?: string;
+  send: (event: unknown) => void;
+  getSnapshot?: () => unknown;
+  system?: {
+    _relay?: (source: unknown, target: unknown, event: unknown) => void;
+  };
+}
+
+/**
+ * Resolve a sessionId to a live actor ref by walking the actor tree.
+ *
+ * XState's system keeps a sessionId→ref registry, but it's closure-local and
+ * never exposed (`system.get` only resolves *keyed* actors, not arbitrary
+ * children). Each snapshot exposes `children: Record<string, AnyActorRef>` and
+ * every ref carries `.sessionId`, so we recurse from the root to find the match.
+ */
+function findBySessionId(
+  root: RoutableActorRef,
+  sessionId: string
+): RoutableActorRef | undefined {
+  if (root.sessionId === sessionId) return root;
+  const snapshot = root.getSnapshot?.() as
+    | { children?: Record<string, RoutableActorRef> }
+    | undefined;
+  const children = snapshot?.children;
+  if (!children) return undefined;
+  for (const child of Object.values(children)) {
+    const found = findBySessionId(child, sessionId);
+    if (found) return found;
+  }
+  return undefined;
+}
+
+/**
  * Handle an XState delayed event alarm.
  * Called from the Durable Object's alarm() handler.
+ *
+ * Delivers the delayed event to the *recorded target* — which is usually the
+ * root actor (top-level `after`), but may be an invoked child actor that
+ * scheduled its own delay. Routing it back to the root would silently drop the
+ * child's timer after hibernation, so we resolve the stored session IDs to refs.
  */
 export function handleXStateAlarm(
   alarmData: XStateAlarmData,
-  actor: { send: (event: unknown) => void; system?: { _relay?: (source: unknown, target: unknown, event: unknown) => void } }
+  actor: RoutableActorRef
 ): void {
-  const { scheduledEventId, event } = alarmData;
+  const { scheduledEventId, event, sourceSessionId, targetSessionId } =
+    alarmData;
 
   scheduledEventsMap.delete(scheduledEventId);
 
   try {
-    if (actor.system && actor.system._relay) {
-      actor.system._relay(actor, actor, event);
-    } else {
+    // Fast path: the delay targets the root actor (the common case).
+    if (!targetSessionId || targetSessionId === actor.sessionId) {
       actor.send(event);
+      return;
+    }
+
+    const target = findBySessionId(actor, targetSessionId);
+    if (!target) {
+      // The target child was stopped before its alarm fired — the delayed event
+      // is moot. Drop it rather than misdeliver to the root actor.
+      return;
+    }
+
+    const source = findBySessionId(actor, sourceSessionId) ?? actor;
+    if (actor.system?._relay) {
+      actor.system._relay(source, target, event);
+    } else {
+      target.send(event);
     }
   } catch (error) {
     console.error(`[AlarmScheduler] Error handling XState alarm:`, error);

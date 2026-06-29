@@ -17,6 +17,13 @@ export interface EventLogOptions {
  * Event log entry before storage
  */
 export interface EventLogEntry {
+  /**
+   * Sequence number captured synchronously for *this* event. Must be passed in
+   * rather than read at write time: recordEvent runs after an async checksum, so
+   * reading the live `eventSequence` would give every queued event the final
+   * value and collide on the `seq` primary key.
+   */
+  seq: number;
   type: string;
   caller: Caller;
   payload: Record<string, unknown>;
@@ -68,7 +75,7 @@ export class EventLog {
   recordEvent(entry: EventLogEntry): void {
     if (!this.options.eventLog) return;
 
-    const seq = this.eventSequence;
+    const seq = entry.seq;
     const redactedPayload = this.redactFields(entry.payload);
 
     const insert: EventInsert = {

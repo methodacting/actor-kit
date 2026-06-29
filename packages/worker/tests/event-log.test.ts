@@ -139,8 +139,9 @@ describe("EventLog", () => {
 
   describe("recording events", () => {
     it("should record event when eventLog is enabled", () => {
-      eventLog.nextSequence();
+      const seq = eventLog.nextSequence();
       eventLog.recordEvent({
+        seq,
         type: "ADD_TODO",
         caller: { id: "user-1", type: "client" },
         payload: { text: "Buy milk" },
@@ -160,8 +161,9 @@ describe("EventLog", () => {
         { eventLog: false },
         0
       );
-      disabledLog.nextSequence();
+      const seq = disabledLog.nextSequence();
       disabledLog.recordEvent({
+        seq,
         type: "ADD_TODO",
         caller: { id: "user-1", type: "client" },
         payload: {},
@@ -181,8 +183,9 @@ describe("EventLog", () => {
         { eventLog: true, redact: ["storage", "env"] },
         0
       );
-      redactLog.nextSequence();
+      const seq = redactLog.nextSequence();
       redactLog.recordEvent({
+        seq,
         type: "TEST",
         caller: { id: "user-1", type: "client" },
         payload: { storage: "secret", env: "secret", text: "visible" },
@@ -208,8 +211,9 @@ describe("EventLog", () => {
       );
 
       for (let i = 0; i < 5; i++) {
-        prunedLog.nextSequence();
+        const seq = prunedLog.nextSequence();
         prunedLog.recordEvent({
+          seq,
           type: `EVENT_${i}`,
           caller: { id: "user-1", type: "client" },
           payload: {},
