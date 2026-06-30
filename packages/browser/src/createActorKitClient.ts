@@ -1,4 +1,8 @@
-import { applyPatch } from "fast-json-patch";
+// fast-json-patch ships no `exports` map and its `main` is the CJS build, so a bare
+// named import resolves to CJS under Node ESM and cjs-module-lexer can't detect
+// `applyPatch`. Import the default (CJS module.exports) and destructure off it.
+import fastJsonPatch from "fast-json-patch";
+const { applyPatch } = fastJsonPatch;
 import { produce } from "immer";
 
 import { EmittedEventSchema } from "@actor-kit/types";
