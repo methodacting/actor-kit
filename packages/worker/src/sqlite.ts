@@ -180,8 +180,18 @@ export class SqliteStorage {
 
   insertAlarm(options: AlarmScheduleOptions): void {
     this.ensureInitialized();
+    // Upsert: re-scheduling an alarm id (e.g. XState re-entering a state with the
+    // same `after` delay) replaces the pending alarm instead of throwing on the
+    // primary key — a thrown insert would be swallowed by the scheduler's catch
+    // and the alarm silently lost.
     this.sql.exec(
-      "INSERT INTO alarms (id, type, scheduled_at, repeat_interval, payload, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+      `INSERT INTO alarms (id, type, scheduled_at, repeat_interval, payload, created_at)
+       VALUES (?, ?, ?, ?, ?, ?)
+       ON CONFLICT(id) DO UPDATE SET
+        type = excluded.type,
+        scheduled_at = excluded.scheduled_at,
+        repeat_interval = excluded.repeat_interval,
+        payload = excluded.payload`,
       options.id,
       options.type,
       options.scheduledAt,
@@ -287,6 +297,20 @@ export class SqliteStorage {
     );
   }
 
+  /**
+   * Keep only the most recent `keep` snapshot rows (by write order).
+   * Snapshots are written on every persisted transition, so without pruning the
+   * table grows unboundedly for long-lived actors.
+   */
+  pruneSnapshots(keep: number): void {
+    if (keep <= 0) return;
+    this.ensureInitialized();
+    this.sql.exec(
+      "DELETE FROM snapshots WHERE id NOT IN (SELECT id FROM snapshots ORDER BY seq DESC, id DESC LIMIT ?)",
+      keep
+    );
+  }
+
   // ==================== Event Log ====================
 
   insertEvent(event: EventInsert): void {
@@ -363,23 +387,6 @@ export class SqliteStorage {
   }
 
   // ==================== Migration ====================
-
-  /**
-   * Migrate data from legacy KV storage to SQLite.
-   * Called on first boot after enabling SQLite on the DO class.
-   */
-  migrateFromKV(storage: DurableObjectStorage, actorId: string): void {
-    this.ensureInitialized();
-
-    // Check if already migrated
-    const schemaVersion = this.getMeta("schema_version");
-    if (schemaVersion) return;
-
-    // Migrate is sync since we need to block concurrency anyway.
-    // The actual KV reads happen before this is called.
-    this.setMeta("schema_version", "1");
-    this.setMeta("created_at", String(Date.now()));
-  }
 
   /**
    * Migrate legacy KV data to SQLite tables.

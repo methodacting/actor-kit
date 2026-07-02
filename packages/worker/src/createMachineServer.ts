@@ -31,11 +31,12 @@ import { SqliteStorage } from "./sqlite";
 import { AlarmManager, type Alarm } from "./alarms";
 import { EventLog, restoreEventSequence } from "./event-log";
 import {
-  createAlarmScheduler,
-  handleXStateAlarm,
-  restoreScheduledEvents,
+  XStateAlarmScheduler,
   type XStateAlarmData,
 } from "./durable-object-system";
+
+/** Default bounded history for SQLite snapshot rows (see `SqliteOptions.maxSnapshots`). */
+const DEFAULT_MAX_SNAPSHOTS = 10;
 
 const StorageSchema = z.object({
   actorType: z.string(),
@@ -138,6 +139,7 @@ export const createMachineServer = <
     // the server keeps its original KV + in-memory-scheduler behaviour untouched.
     sqliteStorage: SqliteStorage | null = null;
     alarmManager: AlarmManager | null = null;
+    alarmScheduler: XStateAlarmScheduler | null = null;
     eventLog: EventLog | null = null;
 
     constructor(state: DurableObjectState, env: EnvFromMachine<TMachine>) {
@@ -152,6 +154,7 @@ export const createMachineServer = <
 
         if (options.enableAlarms) {
           this.alarmManager = new AlarmManager(this.sqliteStorage, this.state);
+          this.alarmScheduler = new XStateAlarmScheduler(this.alarmManager);
         }
 
         if (options.sqlite) {
@@ -233,7 +236,7 @@ export const createMachineServer = <
               scheduledAt: a.scheduledAt,
             }));
           if (xstateAlarms.length > 0) {
-            restoreScheduledEvents(xstateAlarms);
+            this.alarmScheduler?.restoreScheduledEvents(xstateAlarms);
           }
           this.alarmManager.rescheduleNextAlarm();
         }
@@ -283,9 +286,9 @@ export const createMachineServer = <
      * hibernation. No-op unless alarms are enabled.
      */
     #installAlarmScheduler(actor: Actor<TMachine>) {
-      if (this.alarmManager && actor.system) {
+      if (this.alarmScheduler && actor.system) {
         (actor.system as unknown as { scheduler: unknown }).scheduler =
-          createAlarmScheduler(this.alarmManager, actor.system);
+          this.alarmScheduler.scheduler();
       }
     }
 
@@ -389,6 +392,11 @@ export const createMachineServer = <
         const checksum = await this.#calculateChecksum(snapshot);
         const seq = this.eventLog?.getSequence() ?? 0;
         this.sqliteStorage.insertSnapshot(seq, data, checksum);
+        // Snapshots are written per transition; keep a bounded history so the
+        // table doesn't grow without limit for long-lived actors.
+        this.sqliteStorage.pruneSnapshots(
+          options?.sqlite?.maxSnapshots ?? DEFAULT_MAX_SNAPSHOTS
+        );
       } else {
         await this.storage.put(PERSISTED_SNAPSHOT_KEY, data);
       }
@@ -838,11 +846,13 @@ export const createMachineServer = <
       if (!this.alarmManager) return;
 
       this.alarmManager.handleDueAlarms((alarm: Alarm) => {
-        if (alarm.type === "xstate-delay" && this.actor) {
+        if (alarm.type === "xstate-delay" && this.actor && this.alarmScheduler) {
           const alarmData = alarm.payload as unknown as XStateAlarmData;
-          handleXStateAlarm(
+          this.alarmScheduler.handleAlarm(
             alarmData,
-            this.actor as unknown as Parameters<typeof handleXStateAlarm>[1]
+            this.actor as unknown as Parameters<
+              XStateAlarmScheduler["handleAlarm"]
+            >[1]
           );
         }
         // Custom alarm types can be handled by extending this.

@@ -16,11 +16,9 @@ export { AlarmManager, generateAlarmId } from "./alarms";
 export type { Alarm, AlarmType, ScheduleAlarmOptions } from "./alarms";
 export { EventLog, restoreEventSequence } from "./event-log";
 export type { EventLogOptions, EventLogEntry } from "./event-log";
-export {
-  createAlarmScheduler,
-  handleXStateAlarm,
-  restoreScheduledEvents,
-  getScheduledEvents,
-  NOOP_CLOCK,
+export { XStateAlarmScheduler } from "./durable-object-system";
+export type {
+  XStateAlarmData,
+  ScheduledEventSnapshot,
+  XStateScheduler,
 } from "./durable-object-system";
-export type { XStateAlarmData, ScheduledEventSnapshot } from "./durable-object-system";

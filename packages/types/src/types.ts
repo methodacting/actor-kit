@@ -191,6 +191,8 @@ export interface SqliteOptions {
   maxEvents?: number;
   /** Fields to strip from logged event payloads */
   redact?: string[];
+  /** Maximum number of snapshot rows to keep (default: 10, 0 = unlimited) */
+  maxSnapshots?: number;
 }
 
 export type MachineServerOptions = {
