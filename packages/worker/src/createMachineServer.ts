@@ -42,7 +42,7 @@ const StorageSchema = z.object({
   actorType: z.string(),
   actorId: z.string(),
   initialCaller: CallerSchema,
-  input: z.record(z.unknown()),
+  input: z.record(z.string(), z.unknown()),
 });
 
 const WebSocketAttachmentSchema = z.object({
@@ -198,7 +198,7 @@ export const createMachineServer = <
                 actorType,
                 actorId,
                 initialCaller: parseStoredJson(initialCallerString, CallerSchema),
-                input: parseStoredJson(inputString, z.record(z.unknown())),
+                input: parseStoredJson(inputString, z.record(z.string(), z.unknown())),
               });
 
               this.actorType = parsedData.actorType;
@@ -417,7 +417,9 @@ export const createMachineServer = <
       }
 
       const hasRequiredFields = Object.values(schemas.inputProps.shape).some(
-        (field) => !field.isOptional()
+        // `undefined` failing to parse means the field is required
+        // (zod 4 dropped `isOptional()` from core shape values)
+        (field) => !z.safeParse(field, undefined).success
       );
 
       if (hasRequiredFields && !searchParams.input) {

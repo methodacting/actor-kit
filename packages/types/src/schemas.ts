@@ -8,7 +8,7 @@ export const BotManagementSchema = z.object({
     passed: z.boolean(),
   }),
   staticResource: z.boolean(),
-  detectionIds: z.record(z.any()),
+  detectionIds: z.record(z.string(), z.any()),
   score: z.number(),
 });
 
@@ -120,7 +120,9 @@ export const CallerStringSchema = z.string().transform((val, ctx) => {
 
   const callerTypeParseResult = CallerIdTypeSchema.safeParse(typeStr);
   if (!callerTypeParseResult.success) {
-    callerTypeParseResult.error.issues.forEach(ctx.addIssue);
+    for (const issue of callerTypeParseResult.error.issues) {
+      ctx.addIssue({ code: z.ZodIssueCode.custom, message: issue.message });
+    }
     return z.NEVER;
   }
   const type = callerTypeParseResult.data;

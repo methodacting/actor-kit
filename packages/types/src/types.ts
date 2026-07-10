@@ -5,6 +5,11 @@ import type { Operation } from "fast-json-patch";
 declare class DurableObject {
   constructor(state: DurableObjectState, env: unknown);
 }
+// Structural stand-in for Rpc.DurableObjectBranded from @cloudflare/workers-types,
+// so `DurableObjectNamespace<ActorServer<TMachine>>` satisfies its brand constraint.
+declare interface DurableObjectBranded {
+  __DURABLE_OBJECT_BRAND: never;
+}
 declare interface DurableObjectState {
   storage: DurableObjectStorage;
   id: DurableObjectId;
@@ -76,8 +81,10 @@ export interface ActorServerMethods<TMachine extends AnyActorKitStateMachine> {
   }>;
 }
 
+// Branded so `DurableObjectNamespace<ActorServer<TMachine>>` satisfies the
+// `Rpc.DurableObjectBranded` constraint in @cloudflare/workers-types.
 export type ActorServer<TMachine extends AnyActorKitStateMachine> =
-  DurableObject & ActorServerMethods<TMachine>;
+  DurableObject & ActorServerMethods<TMachine> & DurableObjectBranded;
 export type AnyActorServer = ActorServer<AnyActorKitStateMachine>;
 
 export type Caller = z.infer<typeof CallerSchema>;
@@ -97,7 +104,6 @@ type EventObject = {
 };
 
 type EventSchemaUnion = z.ZodDiscriminatedUnion<
-  "type",
   [
     z.ZodObject<z.ZodRawShape & { type: z.ZodString }>,
     ...z.ZodObject<z.ZodRawShape & { type: z.ZodString }>[]
