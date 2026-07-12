@@ -134,6 +134,53 @@ describe("createActorKitRouter", () => {
     expect(secondResponse.status).toBe(200);
   });
 
+  it("forwards ?input= JSON to the first spawn", async () => {
+    const { env, stub } = createEnv();
+    const token = await createBearerToken();
+    const router = createActorKitRouter<typeof env>(["todo"]);
+
+    const seed = { ownerId: "user-42", titles: ["first"] };
+    const response = await router(
+      new Request(
+        `https://example.com/api/todo/list-1?input=${encodeURIComponent(
+          JSON.stringify(seed)
+        )}`,
+        { headers: { Authorization: `Bearer ${token}` } }
+      ),
+      env
+    );
+
+    expect(response.status).toBe(200);
+    expect(stub.spawn).toHaveBeenCalledTimes(1);
+    expect(stub.spawn).toHaveBeenCalledWith({
+      actorType: "todo",
+      actorId: "list-1",
+      caller: { id: "user-42", type: "client" },
+      input: seed,
+    });
+  });
+
+  it("falls back to an empty seed when ?input= is not valid JSON", async () => {
+    const { env, stub } = createEnv();
+    const token = await createBearerToken();
+    const router = createActorKitRouter<typeof env>(["todo"]);
+
+    const response = await router(
+      new Request("https://example.com/api/todo/list-1?input=not-json", {
+        headers: { Authorization: `Bearer ${token}` },
+      }),
+      env
+    );
+
+    expect(response.status).toBe(200);
+    expect(stub.spawn).toHaveBeenCalledWith({
+      actorType: "todo",
+      actorId: "list-1",
+      caller: { id: "user-42", type: "client" },
+      input: {},
+    });
+  });
+
   it("parses websocket auth from the query string and forwards upgrades", async () => {
     const { env, stub } = createEnv();
     const token = await createBearerToken();

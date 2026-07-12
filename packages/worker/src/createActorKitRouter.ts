@@ -132,12 +132,23 @@ export const createActorKitRouter = <Env extends ActorKitEnv>(
 
     // Check if the actor has already been spawned
     if (!spawnedActors.has(actorKey)) {
-      // If not, spawn it and mark it as spawned
+      // Forward caller-provided seed input (`?input=` JSON) so a first spawn
+      // through the router seeds the machine the same way the Durable Object's
+      // own request-setup path does. Invalid JSON falls back to an empty seed.
+      let input: Record<string, unknown> = {};
+      const rawInput = url.searchParams.get("input");
+      if (rawInput) {
+        try {
+          input = z.record(z.string(), z.unknown()).parse(JSON.parse(rawInput));
+        } catch {
+          input = {};
+        }
+      }
       await durableObjectStub.spawn({
         actorType,
         actorId,
         caller,
-        input: {},
+        input,
       });
       spawnedActors.add(actorKey);
     }
