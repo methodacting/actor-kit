@@ -8,3 +8,6 @@ packages:
   - packages/storybook
   - examples/*
   - website
+
+catalog:
+  wrangler: 4.110.0
