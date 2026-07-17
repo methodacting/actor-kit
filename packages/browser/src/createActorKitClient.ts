@@ -24,6 +24,14 @@ export type ActorKitClientProps<TMachine extends AnyActorKitStateMachine> = {
   initialSnapshot: CallerSnapshotFrom<TMachine>;
   onStateChange?: (newState: CallerSnapshotFrom<TMachine>) => void;
   onError?: (error: Error) => void;
+  /**
+   * Async access-token provider. When present it is called before every
+   * *reconnect* dial to mint a fresh token, so the connection survives token
+   * expiry (short TTLs) and signing-key rotation without a page reload. The
+   * initial connect still uses `accessToken` (the fast path) — the provider is
+   * only consulted on reconnect, where a stale token would otherwise 401.
+   */
+  getAccessToken?: () => Promise<string>;
 };
 
 type Listener<T> = (state: T) => void;
@@ -40,6 +48,10 @@ export function createActorKitClient<TMachine extends AnyActorKitStateMachine>(
 ): ActorKitClient<TMachine> {
   let currentSnapshot = props.initialSnapshot;
   let socket: WebSocket | null = null;
+
+  // The token in play right now. Seeded with the initial (fast-path) token and
+  // replaced by `getAccessToken()` before each reconnect dial.
+  let currentAccessToken = props.accessToken;
 
   let shouldReconnect = true;
   const listeners: Set<Listener<CallerSnapshotFrom<TMachine>>> = new Set();
@@ -59,9 +71,31 @@ export function createActorKitClient<TMachine extends AnyActorKitStateMachine>(
    * Establishes a WebSocket connection to the Actor Kit server.
    * @returns {Promise<void>} A promise that resolves when the connection is established.
    */
+  /**
+   * Mint a fresh token (when a provider is configured) then dial again. Used by
+   * the reconnect path so an expired/rotated token is replaced before redialing;
+   * a provider failure surfaces via `onError` but still falls back to redialing
+   * with the last known token so a transient token-endpoint blip doesn't strand
+   * the connection.
+   */
+  const reconnectWithFreshToken = async () => {
+    if (props.getAccessToken) {
+      try {
+        currentAccessToken = await props.getAccessToken();
+      } catch (error: unknown) {
+        props.onError?.(
+          error instanceof Error
+            ? error
+            : new Error("Failed to refresh access token")
+        );
+      }
+    }
+    void connect();
+  };
+
   const connect = async () => {
     shouldReconnect = true;
-    const url = getWebSocketUrl(props);
+    const url = getWebSocketUrl({ ...props, accessToken: currentAccessToken });
 
     socket = new WebSocket(url);
 
@@ -104,15 +138,24 @@ export function createActorKitClient<TMachine extends AnyActorKitStateMachine>(
     // later after it's disconnected
 
     socket.addEventListener("close", (_event) => {
-  
-
-      // Implement reconnection logic
+      // Reconnect with a freshly-minted token (covers token expiry / key
+      // rotation / auth-rejection close codes — the token is always renewed
+      // before redialing when a provider is configured).
       if (shouldReconnect && reconnectAttempts < maxReconnectAttempts) {
         reconnectAttempts++;
         const delay = Math.min(1000 * Math.pow(2, reconnectAttempts), 30000);
-        setTimeout(connect, delay);
+        setTimeout(() => {
+          void reconnectWithFreshToken();
+        }, delay);
       } else if (shouldReconnect) {
-        console.error(`[ActorKitClient] Max reconnection attempts reached`);
+        // Backoff exhausted — this is a terminal transport failure. Surface it
+        // so the app can show the connection as lost (not just log it).
+        console.error("[ActorKitClient] Max reconnection attempts reached");
+        props.onError?.(
+          new Error(
+            "Realtime connection lost: reconnection attempts exhausted"
+          )
+        );
       }
     });
 

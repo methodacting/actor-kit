@@ -23,7 +23,10 @@ export const createAccessToken = async ({
     .setJti(actorId)
     .setSubject(subject)
     .setAudience(actorType)
-    .setExpirationTime("30d")
+    // Short-lived by design: the browser client mints a fresh token through its
+    // `getAccessToken` provider on every WebSocket reconnect, so a 1h TTL keeps
+    // live tokens cheap to leak/rotate without breaking long game sessions.
+    .setExpirationTime("1h")
     .sign(new TextEncoder().encode(signingKey));
   return token;
 };

@@ -77,6 +77,7 @@ function createTestClient(props?: {
   onStateChange?: (state: TestSnapshot) => void;
   onError?: (error: Error) => void;
   initialSnapshot?: TestSnapshot;
+  getAccessToken?: () => Promise<string>;
 }) {
   return createActorKitClient<TestMachine>({
     accessToken: "token-123",
@@ -92,6 +93,7 @@ function createTestClient(props?: {
       },
     onError: props?.onError,
     onStateChange: props?.onStateChange,
+    getAccessToken: props?.getAccessToken,
   });
 }
 
@@ -446,6 +448,83 @@ describe("createActorKitClient", () => {
 
     expect(MockWebSocket.instances).toHaveLength(2);
     expect(MockWebSocket.instances[1]?.readyState).toBe(MockWebSocket.CLOSED);
+  });
+
+  it("mints a fresh token via getAccessToken before each reconnect dial", async () => {
+    vi.useFakeTimers();
+
+    const getAccessToken = vi
+      .fn<() => Promise<string>>()
+      .mockResolvedValue("token-refreshed");
+    const client = createTestClient({ getAccessToken });
+
+    // First connect uses the initial token (fast path — provider NOT called).
+    const connectionPromise = client.connect();
+    const firstSocket = MockWebSocket.instances[0];
+    expect(firstSocket.url).toContain("accessToken=token-123");
+    firstSocket.open();
+    await connectionPromise;
+    expect(getAccessToken).not.toHaveBeenCalled();
+
+    // Simulate an auth-rejected drop: the socket closes and the client
+    // reconnects, minting a fresh token first.
+    firstSocket.close();
+    await vi.advanceTimersByTimeAsync(2000);
+
+    expect(getAccessToken).toHaveBeenCalledTimes(1);
+    const secondSocket = MockWebSocket.instances[1];
+    expect(secondSocket).toBeDefined();
+    expect(secondSocket.url).toContain("accessToken=token-refreshed");
+  });
+
+  it("still redials with the last token when the token provider throws", async () => {
+    vi.useFakeTimers();
+
+    const onError = vi.fn();
+    const getAccessToken = vi
+      .fn<() => Promise<string>>()
+      .mockRejectedValue(new Error("token endpoint down"));
+    const client = createTestClient({ getAccessToken, onError });
+
+    const connectionPromise = client.connect();
+    const firstSocket = MockWebSocket.instances[0];
+    firstSocket.open();
+    await connectionPromise;
+
+    firstSocket.close();
+    await vi.advanceTimersByTimeAsync(2000);
+
+    // Provider failure is surfaced, but the client still reconnects with the
+    // last known token (no stranded connection).
+    expect(onError).toHaveBeenCalledWith(new Error("token endpoint down"));
+    const secondSocket = MockWebSocket.instances[1];
+    expect(secondSocket).toBeDefined();
+    expect(secondSocket.url).toContain("accessToken=token-123");
+  });
+
+  it("surfaces a terminal error once reconnect attempts are exhausted", async () => {
+    vi.useFakeTimers();
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    const onError = vi.fn();
+
+    const client = createTestClient({ onError });
+    const connectionPromise = client.connect();
+    MockWebSocket.instances[0]?.open();
+    await connectionPromise;
+
+    // Drive 5 failed reconnect attempts (maxReconnectAttempts), each closing
+    // immediately, then the 6th close exhausts the budget.
+    const delays = [2000, 4000, 8000, 16000, 30000];
+    MockWebSocket.instances[0]?.close();
+    for (let i = 0; i < delays.length; i += 1) {
+      await vi.advanceTimersByTimeAsync(delays[i]);
+      MockWebSocket.instances[i + 1]?.close();
+    }
+    await vi.advanceTimersByTimeAsync(30000);
+
+    expect(onError).toHaveBeenCalledWith(
+      new Error("Realtime connection lost: reconnection attempts exhausted")
+    );
   });
 
   it("uses exponential backoff and stops after the max reconnect attempts", async () => {
