@@ -1,7 +1,7 @@
 {
   "private": true,
   "type": "module",
-  "packageManager": "pnpm@10.28.2",
+  "packageManager": "pnpm@11.15.1",
   "scripts": {
     "build": "pnpm --filter @actor-kit/types build && pnpm --filter '@actor-kit/*' --filter '!@actor-kit/types' build",
     "typecheck": "pnpm -r typecheck",
