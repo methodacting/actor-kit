@@ -19,6 +19,10 @@
     "check": "prettier --write . && eslint --fix"
   },
   "dependencies": {
+    "@actor-kit/react": "workspace:*",
+    "@actor-kit/server": "workspace:*",
+    "@actor-kit/types": "workspace:*",
+    "@actor-kit/worker": "workspace:*",
     "@tailwindcss/vite": "^4.1.18",
     "@tanstack/react-devtools": "0.9.13",
     "@tanstack/react-router": "1.166.7",
@@ -26,10 +30,6 @@
     "@tanstack/react-router-ssr-query": "1.166.7",
     "@tanstack/react-start": "1.166.7",
     "@tanstack/router-plugin": "1.166.7",
-    "@actor-kit/types": "workspace:*",
-    "@actor-kit/worker": "workspace:*",
-    "@actor-kit/react": "workspace:*",
-    "@actor-kit/server": "workspace:*",
     "h3": "^2.0.1-rc.16",
     "lucide-react": "^0.577.0",
     "nitro": "3.0.260311-beta",
@@ -57,6 +57,6 @@
     "vite": "^7.3.1",
     "vite-tsconfig-paths": "^6.1.1",
     "vitest": "^4.1.0",
-    "wrangler": "catalog:"
+    "wrangler": "^4.119.0"
   }
 }

@@ -25,10 +25,10 @@
     "husky": "^9.1.7",
     "immer": "^11.1.4",
     "jose": "^6.2.1",
-    "miniflare": "^4.20260317.0",
+    "miniflare": "5.20260801.0-alpha",
     "vitest": "^4.1.0",
     "wait-on": "^9.0.4",
-    "wrangler": "catalog:",
+    "wrangler": "^4.119.0",
     "xstate": "^5.28.0",
     "zod": "^3.25.76"
   },

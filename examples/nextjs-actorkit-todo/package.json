@@ -14,10 +14,10 @@
     "cf-typegen": "wrangler types"
   },
   "dependencies": {
-    "@actor-kit/types": "workspace:*",
-    "@actor-kit/worker": "workspace:*",
     "@actor-kit/react": "workspace:*",
     "@actor-kit/server": "workspace:*",
+    "@actor-kit/types": "workspace:*",
+    "@actor-kit/worker": "workspace:*",
     "cookie": "^0.6.0",
     "next": "14.2.13",
     "react": "^18",
@@ -36,6 +36,6 @@
     "postcss": "^8",
     "tailwindcss": "^3.4.1",
     "typescript": "^5",
-    "wrangler": "catalog:"
+    "wrangler": "^4.119.0"
   }
 }
